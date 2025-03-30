@@ -134,7 +134,12 @@ def run_backtests_on_symbols(symbols, port=7496):
             Dense(self.forecast_horizon)
         ])
         self.lstm_model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
-        self.lstm_model.fit(X_lstm, y_lstm, epochs=10, batch_size=32, verbose=0)
+        import tensorflow as tf
+
+dataset = tf.data.Dataset.from_tensor_slices((X_lstm, y_lstm))
+dataset = dataset.cache().shuffle(1000).batch(32).prefetch(tf.data.AUTOTUNE)
+
+self.lstm_model.fit(dataset, epochs=10, verbose=0)
 
         self.lstm_sequence_df = lstm_df.copy()
 
