@@ -1,10 +1,10 @@
-
-import yfinance as yf
+from ib_insync import *
 import pandas as pd
 import numpy as np
 import random
 import os
 import tensorflow as tf
+from datetime import datetime
 
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
@@ -25,46 +25,69 @@ def set_seeds(seed=42):
 set_seeds()
 
 LOOKAHEAD = 5
+TAKE_PROFIT_PERCENT = 0.02  # 2%
+STOP_LOSS_PERCENT = 0.01    # 1%
+ORDER_QUANTITY = 10
 
-# Pre-screening using fast metadata only (no historical download yet)
-def screen_candidates(all_tickers, min_market_cap=10e9, min_avg_volume=1e6):
-    valid = []
-    for ticker in all_tickers:
+ib = IB()
+ib.connect('127.0.0.1', 7496, clientId=1)
+
+def expand_scanner(min_market_cap=10e9, min_volume=1e6):
+    scan_codes = ['MOST_ACTIVE', 'TOP_PERC_GAIN', 'TOP_PERC_LOSE', 'HOT_BY_VOLUME']
+    location = 'STK.US.MAJOR'
+    found = set()
+    for scan_code in scan_codes:
+        scan_sub = ScannerSubscription(
+            instrument='STK',
+            locationCode=location,
+            scanCode=scan_code
+        )
         try:
-            info = yf.Ticker(ticker).info
-            if (
-                info.get("marketCap", 0) >= min_market_cap and
-                info.get("averageVolume", 0) >= min_avg_volume
-            ):
-                valid.append(ticker)
-        except:
-            continue
-    return valid
+            results = ib.reqScannerSubscription(scan_sub)
+            ib.sleep(1.5)
+            for res in results:
+                try:
+                    symbol = res.contractDetails.contract.symbol
+                    found.add(symbol)
+                except Exception as e:
+                    print(f"שגיאה בשליפת סימבול: {e}")
+        except Exception as e:
+            print(f"Scanner error ({scan_code}): {e}")
+        print(f"{scan_code} → סה\"כ {len(found)} מניות")
+    return list(found)
 
-# Get top 100 tickers (SPY or broader index)
-def get_top_spy_stocks():
-    top_100 = [
-        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK-B", "UNH", "JNJ",
-        "XOM", "V", "JPM", "PG", "MA", "HD", "CVX", "LLY", "ABBV", "AVGO",
-        "PEP", "MRK", "KO", "COST", "WMT", "BAC", "DIS", "ADBE", "CSCO", "MCD",
-        "QCOM", "TMO", "DHR", "ACN", "ABT", "NEE", "TXN", "LIN", "PM", "BMY",
-        "INTC", "AMD", "AMGN", "LOW", "UNP", "HON", "GS", "RTX", "CAT", "BLK"
-    ]
-    return top_100
+def get_ib_data(symbol, exchange='SMART', currency='USD', duration='3 Y', barSize='1 day'):
+    contract = Stock(symbol, exchange, currency)
+    bars = ib.reqHistoricalData(
+        contract,
+        endDateTime='',
+        durationStr=duration,
+        barSizeSetting=barSize,
+        whatToShow='ADJUSTED_LAST',
+        useRTH=True,
+        formatDate=1
+    )
+    df = util.df(bars)
+    df.set_index('date', inplace=True)
+    return df[['open', 'high', 'low', 'close', 'volume']]
 
-# Download historical data only for valid tickers
-def download_data(tickers):
-    end_date = pd.Timestamp.today()
-    start_date = end_date - pd.DateOffset(years=3)
-    data = yf.download(tickers + ["^VIX", "SPY"], start=start_date, end=end_date, group_by='ticker', auto_adjust=False)
-    adj_close = pd.DataFrame({ticker: data[ticker]['Adj Close'] for ticker in tickers if ticker in data.columns.get_level_values(0)})
-    volume = pd.DataFrame({ticker: data[ticker]['Volume'] for ticker in tickers if ticker in data.columns.get_level_values(0)})
-    vix = data['^VIX']['Adj Close'] if '^VIX' in data.columns.get_level_values(0) else pd.Series()
-    spy = data['SPY']['Adj Close'] if 'SPY' in data.columns.get_level_values(0) else pd.Series()
-    return adj_close, volume, vix, spy
+def download_data_ib(tickers):
+    adj_close_dict = {}
+    volume_dict = {}
+    for ticker in tickers:
+        try:
+            df = get_ib_data(ticker)
+            adj_close_dict[ticker] = df['close']
+            volume_dict[ticker] = df['volume']
+        except Exception as e:
+            print(f"שגיאה בנתונים של {ticker}: {e}")
+    if not adj_close_dict:
+        return pd.DataFrame(), pd.DataFrame()
+    adj_close = pd.concat(adj_close_dict, axis=1)
+    volume = pd.concat(volume_dict, axis=1)
+    return adj_close, volume
 
-
-def create_features(df, volume_series, vix, spy):
+def create_features(df, volume_series):
     features = pd.DataFrame(index=df.index)
     features['price'] = df
     features['returns'] = df.pct_change()
@@ -78,24 +101,21 @@ def create_features(df, volume_series, vix, spy):
     features['momentum_signal'] = (features['momentum'] > 0).astype(int).rolling(window=5).mean()
     features['open'] = df.shift(1)
     features['close'] = df
-    features['candle_signal'] = np.where(
-        abs(features['close'] - features['open']) < 0.002 * features['open'], 0,
-        np.where(features['close'] > features['open'], 1, -1)
-    )
+    features['prev_close'] = df.shift(1)
+    features['gap_pct'] = (features['open'] - features['prev_close']) / features['prev_close']
+    features['is_gap'] = (features['gap_pct'].abs() > 0.03).astype(int)
+    features['gap_direction'] = np.where(features['gap_pct'] > 0, 1, np.where(features['gap_pct'] < 0, -1, 0))
+    features['candle_signal'] = np.where(abs(features['close'] - features['open']) < 0.002 * features['open'], 0, np.where(features['close'] > features['open'], 1, -1))
     features['volume'] = volume_series
     features['volume_sma_20'] = volume_series.rolling(window=20).mean()
     features['volume_ratio'] = volume_series / features['volume_sma_20']
-    features['vix'] = vix.reindex(df.index).fillna(method='ffill')
-    features['spy'] = spy.reindex(df.index).pct_change().fillna(0).rolling(window=5).mean()
     features['target'] = (df.shift(-LOOKAHEAD) > df).astype(int)
     return features.dropna()
-
 
 def train_xgboost(X_train, y_train):
     model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
     model.fit(X_train, y_train)
     return model
-
 
 def train_lstm(X, y):
     model = Sequential()
@@ -108,50 +128,77 @@ def train_lstm(X, y):
     model.fit(X, y, epochs=5, batch_size=32, verbose=0)
     return model
 
+def place_order(symbol, direction, price):
+    contract = Stock(symbol, 'SMART', 'USD')
+    ib.qualifyContracts(contract)
+    action = 'BUY' if direction == 'LONG' else 'SELL'
 
-def recommend_stocks(adj_close_data, volume_data, vix, spy):
+    parent = MarketOrder(action, ORDER_QUANTITY)
+    parent.transmit = False
+
+    tp_price = round(price * (1 + TAKE_PROFIT_PERCENT), 2) if direction == 'LONG' else round(price * (1 - TAKE_PROFIT_PERCENT), 2)
+    sl_price = round(price * (1 - STOP_LOSS_PERCENT), 2) if direction == 'LONG' else round(price * (1 + STOP_LOSS_PERCENT), 2)
+
+    tp_order = LimitOrder('SELL' if action == 'BUY' else 'BUY', ORDER_QUANTITY, tp_price, parentId=parent.orderId)
+    tp_order.transmit = False
+
+    sl_order = StopOrder('SELL' if action == 'BUY' else 'BUY', ORDER_QUANTITY, sl_price, parentId=parent.orderId)
+    sl_order.transmit = True
+
+    trade = ib.placeOrder(contract, parent)
+    ib.placeOrder(contract, tp_order)
+    ib.placeOrder(contract, sl_order)
+
+    print(f"נשלחה הוראת {action} MARKET ל-{symbol} עם TP={tp_price}, SL={sl_price}")
+    return trade
+
+def recommend_stocks(adj_close_data, volume_data):
     recommendations = []
-
     for ticker in adj_close_data.columns:
         prices = adj_close_data[ticker].dropna()
         volume = volume_data[ticker].dropna()
         if len(prices) < 200 or len(volume) < 200:
             continue
-
-        features = create_features(prices, volume, vix, spy)
+        features = create_features(prices, volume)
         X = features.drop(['target', 'price'], axis=1)
         y = features['target']
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
-
         X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, shuffle=False, random_state=42)
         xgb_model = train_xgboost(X_train, y_train)
         lstm_X = X_train.reshape((X_train.shape[0], 1, X_train.shape[1]))
         lstm_model = train_lstm(lstm_X, y_train)
-
         X_live = X_scaled[-1:]
         lstm_input = X_live.reshape((1, 1, X_live.shape[1]))
-
         xgb_prob = xgb_model.predict_proba(X_live)[0, 1]
         lstm_prob = lstm_model.predict(lstm_input)[0, 0]
         avg_prob = (xgb_prob + lstm_prob) / 2
-
         confidence = abs(avg_prob - 0.5)
         direction = "LONG" if avg_prob > 0.5 else "SHORT"
-        candle_signal = features['candle_signal'].iloc[-1]
-
-        if (direction == "LONG" and candle_signal == 1) or (direction == "SHORT" and candle_signal == -1):
+        price_now = prices.iloc[-1]
+        if avg_prob > 0.80:
+            trade = place_order(ticker, direction, price_now)
             recommendations.append((ticker, direction, round(avg_prob, 3), round(confidence, 3)))
-
     recommendations.sort(key=lambda x: x[3], reverse=True)
-    return recommendations[:2]
+    return recommendations[:3]
 
+def save_recommendations(recommendations):
+    df = pd.DataFrame(recommendations, columns=['Ticker', 'Direction', 'Probability', 'Confidence'])
+    filename = f"recommendations_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+    df.to_csv(filename, index=False)
+    print(f"Recommendations saved to {filename}")
 
-tickers = screen_candidates(get_top_spy_stocks())
-adj_close_data, volume_data, vix_data, spy_data = download_data(tickers)
-print("Loaded data for", len(adj_close_data.columns), "tickers")
-
-best_stocks = recommend_stocks(adj_close_data, volume_data, vix_data, spy_data)
-print("Top Stock Recommendations:")
-for ticker, direction, prob, confidence in best_stocks:
-    print(f"{ticker}: {direction} (prob={prob}, confidence={confidence})")
+if __name__ == "__main__":
+    tickers = expand_scanner(min_market_cap=10e9, min_volume=1e6)
+    adj_close_data, volume_data = download_data_ib(tickers)
+    if adj_close_data.empty:
+        print("לא נמצאו מניות מתאימות לסריקה.")
+    else:
+        print("Loaded data for", len(adj_close_data.columns), "tickers")
+        best_stocks = recommend_stocks(adj_close_data, volume_data)
+        print("Top 3 Stock Recommendations:")
+        for ticker, direction, prob, confidence in best_stocks:
+            print(f"{ticker}: {direction} (prob={prob}, confidence={confidence})")
+        if best_stocks:
+            save_recommendations(best_stocks)
+    
