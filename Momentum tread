@@ -30,9 +30,14 @@ STOP_LOSS_PERCENT = 0.01    # 1%
 ORDER_QUANTITY = 10
 
 ib = IB()
-ib.connect('127.0.0.1', 7496, clientId=1)
+while not ib.isConnected():
+    try:
+        ib.connect('127.0.0.1', 7496, clientId=random.randint(1, 9999))
+    except Exception as e:
+        print(f"שגיאה בהתחברות ל-IB: {e}")
+        ib.disconnect()
 
-def expand_scanner(min_market_cap=10e9, min_volume=1e6):
+def expand_scanner():
     scan_codes = ['MOST_ACTIVE', 'TOP_PERC_GAIN', 'TOP_PERC_LOSE', 'HOT_BY_VOLUME']
     location = 'STK.US.MAJOR'
     found = set()
@@ -128,30 +133,6 @@ def train_lstm(X, y):
     model.fit(X, y, epochs=5, batch_size=32, verbose=0)
     return model
 
-def place_order(symbol, direction, price):
-    contract = Stock(symbol, 'SMART', 'USD')
-    ib.qualifyContracts(contract)
-    action = 'BUY' if direction == 'LONG' else 'SELL'
-
-    parent = MarketOrder(action, ORDER_QUANTITY)
-    parent.transmit = False
-
-    tp_price = round(price * (1 + TAKE_PROFIT_PERCENT), 2) if direction == 'LONG' else round(price * (1 - TAKE_PROFIT_PERCENT), 2)
-    sl_price = round(price * (1 - STOP_LOSS_PERCENT), 2) if direction == 'LONG' else round(price * (1 + STOP_LOSS_PERCENT), 2)
-
-    tp_order = LimitOrder('SELL' if action == 'BUY' else 'BUY', ORDER_QUANTITY, tp_price, parentId=parent.orderId)
-    tp_order.transmit = False
-
-    sl_order = StopOrder('SELL' if action == 'BUY' else 'BUY', ORDER_QUANTITY, sl_price, parentId=parent.orderId)
-    sl_order.transmit = True
-
-    trade = ib.placeOrder(contract, parent)
-    ib.placeOrder(contract, tp_order)
-    ib.placeOrder(contract, sl_order)
-
-    print(f"נשלחה הוראת {action} MARKET ל-{symbol} עם TP={tp_price}, SL={sl_price}")
-    return trade
-
 def recommend_stocks(adj_close_data, volume_data):
     recommendations = []
     for ticker in adj_close_data.columns:
@@ -175,12 +156,10 @@ def recommend_stocks(adj_close_data, volume_data):
         avg_prob = (xgb_prob + lstm_prob) / 2
         confidence = abs(avg_prob - 0.5)
         direction = "LONG" if avg_prob > 0.5 else "SHORT"
-        price_now = prices.iloc[-1]
         if avg_prob > 0.80:
-            trade = place_order(ticker, direction, price_now)
             recommendations.append((ticker, direction, round(avg_prob, 3), round(confidence, 3)))
     recommendations.sort(key=lambda x: x[3], reverse=True)
-    return recommendations[:3]
+    return recommendations
 
 def save_recommendations(recommendations):
     df = pd.DataFrame(recommendations, columns=['Ticker', 'Direction', 'Probability', 'Confidence'])
@@ -189,16 +168,15 @@ def save_recommendations(recommendations):
     print(f"Recommendations saved to {filename}")
 
 if __name__ == "__main__":
-    tickers = expand_scanner(min_market_cap=10e9, min_volume=1e6)
+    tickers = expand_scanner()
     adj_close_data, volume_data = download_data_ib(tickers)
     if adj_close_data.empty:
         print("לא נמצאו מניות מתאימות לסריקה.")
     else:
         print("Loaded data for", len(adj_close_data.columns), "tickers")
         best_stocks = recommend_stocks(adj_close_data, volume_data)
-        print("Top 3 Stock Recommendations:")
+        print("Stock Recommendations:")
         for ticker, direction, prob, confidence in best_stocks:
             print(f"{ticker}: {direction} (prob={prob}, confidence={confidence})")
         if best_stocks:
             save_recommendations(best_stocks)
-    
