@@ -1,14 +1,15 @@
-from ib_insync import *
 import pandas as pd
 import numpy as np
 import random
 import os
 import tensorflow as tf
 from datetime import datetime
+import yfinance as yf
 
-from ta.momentum import RSIIndicator
+from ta.momentum import RSIIndicator, ROCIndicator
 from ta.trend import MACD
-from ta.momentum import ROCIndicator
+from ta.volatility import AverageTrueRange, BollingerBands
+from ta.volume import OnBalanceVolumeIndicator
 from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 from tensorflow.keras.models import Sequential
@@ -25,71 +26,23 @@ def set_seeds(seed=42):
 set_seeds()
 
 LOOKAHEAD = 5
-TAKE_PROFIT_PERCENT = 0.02  # 2%
-STOP_LOSS_PERCENT = 0.01    # 1%
-ORDER_QUANTITY = 10
 
-ib = IB()
-while not ib.isConnected():
-    try:
-        ib.connect('127.0.0.1', 7496, clientId=random.randint(1, 9999))
-    except Exception as e:
-        print(f"שגיאה בהתחברות ל-IB: {e}")
-        ib.disconnect()
-
-def expand_scanner():
-    scan_codes = ['MOST_ACTIVE', 'TOP_PERC_GAIN', 'TOP_PERC_LOSE', 'HOT_BY_VOLUME']
-    location = 'STK.US.MAJOR'
-    found = set()
-    for scan_code in scan_codes:
-        scan_sub = ScannerSubscription(
-            instrument='STK',
-            locationCode=location,
-            scanCode=scan_code
-        )
+def get_large_cap_tickers(min_market_cap=1e9):
+    tickers = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]['Symbol'].tolist()
+    filtered = []
+    for t in tickers:
         try:
-            results = ib.reqScannerSubscription(scan_sub)
-            ib.sleep(1.5)
-            for res in results:
-                try:
-                    symbol = res.contractDetails.contract.symbol
-                    found.add(symbol)
-                except Exception as e:
-                    print(f"שגיאה בשליפת סימבול: {e}")
-        except Exception as e:
-            print(f"Scanner error ({scan_code}): {e}")
-        print(f"{scan_code} → סה\"כ {len(found)} מניות")
-    return list(found)
+            info = yf.Ticker(t).info
+            if 'marketCap' in info and info['marketCap'] is not None and info['marketCap'] >= min_market_cap:
+                filtered.append(t)
+        except:
+            continue
+    return filtered
 
-def get_ib_data(symbol, exchange='SMART', currency='USD', duration='3 Y', barSize='1 day'):
-    contract = Stock(symbol, exchange, currency)
-    bars = ib.reqHistoricalData(
-        contract,
-        endDateTime='',
-        durationStr=duration,
-        barSizeSetting=barSize,
-        whatToShow='ADJUSTED_LAST',
-        useRTH=True,
-        formatDate=1
-    )
-    df = util.df(bars)
-    df.set_index('date', inplace=True)
-    return df[['open', 'high', 'low', 'close', 'volume']]
-
-def download_data_ib(tickers):
-    adj_close_dict = {}
-    volume_dict = {}
-    for ticker in tickers:
-        try:
-            df = get_ib_data(ticker)
-            adj_close_dict[ticker] = df['close']
-            volume_dict[ticker] = df['volume']
-        except Exception as e:
-            print(f"שגיאה בנתונים של {ticker}: {e}")
-    if not adj_close_dict:
-        return pd.DataFrame(), pd.DataFrame()
-    adj_close = pd.concat(adj_close_dict, axis=1)
-    volume = pd.concat(volume_dict, axis=1)
+def download_data_yahoo(tickers, period='3y'):
+    data = yf.download(tickers, period=period, auto_adjust=True, group_by='ticker')
+    adj_close = pd.concat({ticker: data[ticker]['Close'] for ticker in tickers if ticker in data}, axis=1)
+    volume = pd.concat({ticker: data[ticker]['Volume'] for ticker in tickers if ticker in data}, axis=1)
     return adj_close, volume
 
 def create_features(df, volume_series):
@@ -104,6 +57,19 @@ def create_features(df, volume_series):
     features['rsi'] = RSIIndicator(df).rsi()
     features['momentum'] = ROCIndicator(df).roc()
     features['momentum_signal'] = (features['momentum'] > 0).astype(int).rolling(window=5).mean()
+    features['atr'] = AverageTrueRange(df, df, df).average_true_range()
+
+    # Bollinger Bands
+    bb = BollingerBands(df)
+    features['bb_bbm'] = bb.bollinger_mavg()
+    features['bb_bbh'] = bb.bollinger_hband()
+    features['bb_bbl'] = bb.bollinger_lband()
+    features['bb_width'] = bb.bollinger_wband()
+
+    # OBV
+    obv = OnBalanceVolumeIndicator(close=df, volume=volume_series)
+    features['obv'] = obv.on_balance_volume()
+
     features['open'] = df.shift(1)
     features['close'] = df
     features['prev_close'] = df.shift(1)
@@ -114,7 +80,9 @@ def create_features(df, volume_series):
     features['volume'] = volume_series
     features['volume_sma_20'] = volume_series.rolling(window=20).mean()
     features['volume_ratio'] = volume_series / features['volume_sma_20']
-    features['target'] = (df.shift(-LOOKAHEAD) > df).astype(int)
+
+    future_returns = (df.shift(-LOOKAHEAD) - df) / df
+    features['target'] = (future_returns > 0.01).astype(int)
     return features.dropna()
 
 def train_xgboost(X_train, y_train):
@@ -156,7 +124,9 @@ def recommend_stocks(adj_close_data, volume_data):
         avg_prob = (xgb_prob + lstm_prob) / 2
         confidence = abs(avg_prob - 0.5)
         direction = "LONG" if avg_prob > 0.5 else "SHORT"
+        price_now = prices.iloc[-1]
         if avg_prob > 0.80:
+            print(f"המלצת {direction} על {ticker} במחיר {price_now:.2f} | הסתברות: {avg_prob:.2f}, ביטחון: {confidence:.2f}")
             recommendations.append((ticker, direction, round(avg_prob, 3), round(confidence, 3)))
     recommendations.sort(key=lambda x: x[3], reverse=True)
     return recommendations
@@ -168,10 +138,10 @@ def save_recommendations(recommendations):
     print(f"Recommendations saved to {filename}")
 
 if __name__ == "__main__":
-    tickers = expand_scanner()
-    adj_close_data, volume_data = download_data_ib(tickers)
+    tickers = get_large_cap_tickers(min_market_cap=1e9)
+    adj_close_data, volume_data = download_data_yahoo(tickers)
     if adj_close_data.empty:
-        print("לא נמצאו מניות מתאימות לסריקה.")
+        print("לא נמצאו נתונים היסטוריים.")
     else:
         print("Loaded data for", len(adj_close_data.columns), "tickers")
         best_stocks = recommend_stocks(adj_close_data, volume_data)
