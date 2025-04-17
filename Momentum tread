@@ -82,7 +82,7 @@ def create_features(df, volume_series):
     features['volume_ratio'] = volume_series / features['volume_sma_20']
 
     future_returns = (df.shift(-LOOKAHEAD) - df) / df
-    features['target'] = (future_returns > 0.01).astype(int)
+    features['target'] = np.where(future_returns > 0.02, 1, np.where(future_returns < -0.02, 0, np.nan))
     return features.dropna()
 
 def train_xgboost(X_train, y_train):
@@ -125,7 +125,7 @@ def recommend_stocks(adj_close_data, volume_data):
         confidence = abs(avg_prob - 0.5)
         direction = "LONG" if avg_prob > 0.5 else "SHORT"
         price_now = prices.iloc[-1]
-        if avg_prob > 0.80:
+        if avg_prob > 0.80 or avg_prob < 0.20:
             print(f"המלצת {direction} על {ticker} במחיר {price_now:.2f} | הסתברות: {avg_prob:.2f}, ביטחון: {confidence:.2f}")
             recommendations.append((ticker, direction, round(avg_prob, 3), round(confidence, 3)))
     recommendations.sort(key=lambda x: x[3], reverse=True)
