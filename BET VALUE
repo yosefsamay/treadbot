@@ -1,0 +1,115 @@
+import numpy as np
+import pandas as pd
+import requests
+import datetime
+import webbrowser
+
+np.random.seed(42)
+
+API_KEY = 'd82fcd7df4ce4a35a0215371b492f68d'
+SPORTS = ['soccer', 'basketball_nba', 'icehockey_nhl', 'baseball_mlb', 'mma_mixed_martial_arts']
+REGIONS = 'eu,uk'
+MARKETS = 'h2h'
+BOOKMAKERS = ['Betfair', 'Unibet', 'Pinnacle']
+STAKE = 10
+EV_THRESHOLD = 0.05
+
+# מיפוי כתובות אתרים
+SITE_URLS = {
+    'Betfair': 'https://www.betfair.com/',
+    'Unibet': 'https://www.unibet.com/',
+    'Pinnacle': 'https://www.pinnacle.com/'
+}
+
+# חישוב הסתברויות מנורמלות מתוך היחסים
+def implied_probabilities(row):
+    probs = [1 / row['odds_1'], 1 / row['odds_x'], 1 / row['odds_2']]
+    total = sum(probs)
+    return [p / total for p in probs]
+
+recommendations = []
+
+for SPORT in SPORTS:
+    response = requests.get(
+        f'https://api.the-odds-api.com/v4/sports/{SPORT}/odds',
+        params={
+            'apiKey': API_KEY,
+            'regions': REGIONS,
+            'markets': MARKETS,
+            'oddsFormat': 'decimal'
+        }
+    )
+
+    if response.status_code != 200:
+        print(f"שגיאה בשליפת נתונים מענף {SPORT}", response.status_code)
+        continue
+
+    data = response.json()
+
+    for match in data:
+        home = match['home_team']
+        away = match['away_team']
+        start_time = match['commence_time']
+
+        # סינון משחקים שכבר התחילו
+        match_time = datetime.datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        if match_time <= now_utc:
+            continue
+
+        best_odds = {'1': 0, 'X': 0, '2': 0}
+        best_site = {'1': '', 'X': '', '2': ''}
+
+        for bookmaker in match['bookmakers']:
+            if bookmaker['title'] not in BOOKMAKERS:
+                continue
+            for market in bookmaker['markets']:
+                if market['key'] != 'h2h':
+                    continue
+                for i, outcome in enumerate(['1', 'X', '2']):
+                    try:
+                        price = market['outcomes'][i]['price']
+                        if price > best_odds[outcome]:
+                            best_odds[outcome] = price
+                            best_site[outcome] = bookmaker['title']
+                    except IndexError:
+                        continue
+
+        if 0 in best_odds.values():
+            continue
+
+        prob_1, prob_x, prob_2 = implied_probabilities({
+            'odds_1': best_odds['1'], 'odds_x': best_odds['X'], 'odds_2': best_odds['2']
+        })
+
+        evs = {
+            '1': prob_1 * best_odds['1'] - 1,
+            'X': prob_x * best_odds['X'] - 1,
+            '2': prob_2 * best_odds['2'] - 1
+        }
+        outcome, ev_val = max(evs.items(), key=lambda x: x[1])
+
+        if ev_val >= EV_THRESHOLD:
+            recommendations.append({
+                'Match': f'{home} vs {away}',
+                'Date': start_time,
+                'Sport': SPORT,
+                'Outcome': outcome,
+                'Odds': best_odds[outcome],
+                'EV': round(ev_val, 4),
+                'Stake (₪)': STAKE,
+                'Site': best_site[outcome]
+            })
+
+# הצגת ההמלצה הכי טובה בלבד
+if recommendations:
+    df = pd.DataFrame(recommendations)
+    best = df.loc[df['EV'].idxmax()]
+    print("\n🎯 ההימור הכי מומלץ:")
+    print(f"{best['Date']} | {best['Match']} ({best['Sport']}) | {best['Outcome']} @ {best['Odds']} ({best['EV']} EV) on {best['Site']} → השקעה: ₪{STAKE}")
+    url = SITE_URLS.get(best['Site'])
+    if url:
+        print(f"🔗 פותח {best['Site']}...")
+        webbrowser.open(url)
+else:
+    print("❌ לא נמצאו המלצות עם EV מעל הסף.")
