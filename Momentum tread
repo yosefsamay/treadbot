@@ -1,7 +1,3 @@
-# --- תא ראשון: התקנת ספריות ---
-!pip install yfinance ta xgboost --quiet
-
-# --- תא שני: ייבוא ספריות והגדרות ---
 import pandas as pd
 import numpy as np
 import random
@@ -19,9 +15,7 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
-from google.colab import files
 
-%matplotlib inline
 
 def set_seeds(seed=42):
     np.random.seed(seed)
@@ -33,26 +27,20 @@ set_seeds()
 
 LOOKAHEAD = 5
 
-# --- תא שלישי: הגדרת פונקציות ---
-def get_large_cap_tickers(min_market_cap=1e9):
-    tickers = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]['Symbol'].tolist()
-    filtered = []
-    for t in tickers:
-        try:
-            info = yf.Ticker(t).info
-            if 'marketCap' in info and info['marketCap'] is not None and info['marketCap'] >= min_market_cap:
-                filtered.append(t)
-        except:
-            continue
-    return filtered
+
+def get_sp500_tickers():
+    table = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+    return table['Symbol'].tolist()
+
 
 def download_data_yahoo(tickers, period='3y'):
-    data = yf.download(tickers, period=period, auto_adjust=True, group_by='ticker')
-    adj_close = pd.concat({ticker: data[ticker]['Close'] for ticker in tickers if ticker in data}, axis=1)
-    volume = pd.concat({ticker: data[ticker]['Volume'] for ticker in tickers if ticker in data}, axis=1)
+    data = yf.download(tickers, period=period, auto_adjust=True, group_by='ticker', threads=True)
+    adj_close = pd.concat({ticker: data[ticker]['Close'] for ticker in tickers if ticker in data and 'Close' in data[ticker]}, axis=1)
+    volume = pd.concat({ticker: data[ticker]['Volume'] for ticker in tickers if ticker in data and 'Volume' in data[ticker]}, axis=1)
     return adj_close, volume
 
-def create_features(df, volume_series, vix):
+
+def create_features(df, volume_series, vix, spy_returns):
     features = pd.DataFrame(index=df.index)
     features['price'] = df
     features['returns'] = df.pct_change()
@@ -86,20 +74,24 @@ def create_features(df, volume_series, vix):
     features['volume_sma_20'] = volume_series.rolling(window=20).mean()
     features['volume_ratio'] = volume_series / features['volume_sma_20']
 
-    # --- הוספת מדד VIX ---
     vix_aligned = vix.reindex(features.index).fillna(method='ffill')
     features['vix'] = vix_aligned
     features['vix_scaled'] = features['vix'] / (features['volatility'] + 1e-6)
     features['vix_corr'] = features['returns'].rolling(30).corr(vix_aligned)
 
+    spy_aligned = spy_returns.reindex(features.index).fillna(method='ffill')
+    features['spy_corr'] = features['returns'].rolling(30).corr(spy_aligned)
+
     future_returns = (df.shift(-LOOKAHEAD) - df) / df
     features['target'] = np.where(future_returns > 0.02, 1, np.where(future_returns < -0.02, 0, np.nan))
     return features.dropna()
+
 
 def train_xgboost(X_train, y_train):
     model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
     model.fit(X_train, y_train)
     return model
+
 
 def train_lstm(X, y):
     model = Sequential()
@@ -112,7 +104,8 @@ def train_lstm(X, y):
     model.fit(X, y, epochs=5, batch_size=32, verbose=0)
     return model
 
-def recommend_stocks(adj_close_data, volume_data, vix):
+
+def recommend_stocks(adj_close_data, volume_data, vix, spy_returns):
     recommendations = []
     for ticker in adj_close_data.columns:
         prices = adj_close_data[ticker].dropna()
@@ -120,14 +113,13 @@ def recommend_stocks(adj_close_data, volume_data, vix):
         if len(prices) < 200 or len(volume) < 200:
             continue
 
-        # סינון לפי נזילות
         volume_mean = volume[-20:].mean()
         price_mean = prices[-20:].mean()
         dollar_volume = volume_mean * price_mean
         if volume_mean < 300_000 or dollar_volume < 5_000_000:
             continue
 
-        features = create_features(prices, volume, vix)
+        features = create_features(prices, volume, vix, spy_returns)
         X = features.drop(['target', 'price'], axis=1)
         y = features['target']
         scaler = StandardScaler()
@@ -144,31 +136,40 @@ def recommend_stocks(adj_close_data, volume_data, vix):
         confidence = abs(avg_prob - 0.5)
         direction = "LONG" if avg_prob > 0.5 else "SHORT"
         price_now = prices.iloc[-1]
+
+        # חישוב ירידה/עלייה מקסימלית תוך 5 ימים קדימה (היסטורית)
+        forward_returns = (prices.shift(-LOOKAHEAD) - prices) / prices
+        max_rise = forward_returns.rolling(window=LOOKAHEAD).max().max()
+        max_drop = forward_returns.rolling(window=LOOKAHEAD).min().min()
+
         if avg_prob > 0.80 or avg_prob < 0.20:
-            print(f"\u05d4\u05de\u05dc\u05e6\u05ea {direction} \u05e2\u05dc {ticker} \u05d1\u05de\u05d7\u05d9\u05e8 {price_now:.2f} | \u05d4\u05e1\u05ea\u05d1\u05e8\u05d5\u05ea: {avg_prob:.2f}, \u05d1\u05d9\u05d8\u05d7\u05d5\u05df: {confidence:.2f}")
-            recommendations.append((ticker, direction, round(avg_prob, 3), round(confidence, 3)))
+            print(f"{ticker}: {direction} (prob={avg_prob:.2f}, confidence={confidence:.2f}, max_rise={max_rise:.2%}, max_drop={max_drop:.2%})")
+            recommendations.append((ticker, direction, round(avg_prob, 3), round(confidence, 3), round(max_rise, 4), round(max_drop, 4)))
     recommendations.sort(key=lambda x: x[3], reverse=True)
     return recommendations
 
+
 def save_recommendations(recommendations):
-    df = pd.DataFrame(recommendations, columns=['Ticker', 'Direction', 'Probability', 'Confidence'])
-    filename = f"recommendations_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
-    df.to_csv('/content/' + filename, index=False)
-    files.download('/content/' + filename)
+    df = pd.DataFrame(recommendations, columns=['Ticker', 'Direction', 'Probability', 'Confidence', 'MaxRise5d', 'MaxDrop5d'])
+    os.makedirs("results", exist_ok=True)
+    filename = f"results/recommendations_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+    df.to_csv(filename, index=False)
     print(f"Recommendations saved to {filename}")
 
-# --- תא אחרון: הרצת המודל ---
-tickers = get_large_cap_tickers(min_market_cap=1e9)[:150]  # בחירה של עד 150 מתוך ה-S&P 500
-adj_close_data, volume_data = download_data_yahoo(tickers)
-vix = yf.download('^VIX', start=adj_close_data.index.min(), end=adj_close_data.index.max())['Close']
 
-if adj_close_data.empty:
-    print("לא נמצאו נתונים היסטוריים.")
-else:
-    print("Loaded data for", len(adj_close_data.columns), "tickers")
-    best_stocks = recommend_stocks(adj_close_data, volume_data, vix)
-    print("Stock Recommendations:")
-    for ticker, direction, prob, confidence in best_stocks:
-        print(f"{ticker}: {direction} (prob={prob}, confidence={confidence})")
-    if best_stocks:
-        save_recommendations(best_stocks)
+if __name__ == "__main__":
+    tickers = get_sp500_tickers()[:100]
+    adj_close_data, volume_data = download_data_yahoo(tickers)
+    extra_data = yf.download(['^VIX', 'SPY'], start=adj_close_data.index.min(), end=adj_close_data.index.max())
+    vix = extra_data['Close']['^VIX']
+    spy_returns = extra_data['Close']['SPY'].pct_change()
+    if adj_close_data.empty:
+        print("לא נמצאו נתונים היסטוריים.")
+    else:
+        print("Loaded data for", len(adj_close_data.columns), "tickers")
+        best_stocks = recommend_stocks(adj_close_data, volume_data, vix, spy_returns)
+        print("Stock Recommendations:")
+        for row in best_stocks:
+            print(row)
+        if best_stocks:
+            save_recommendations(best_stocks)
