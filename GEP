@@ -1,0 +1,101 @@
+from ib_insync import *
+import pandas as pd
+import time
+from datetime import datetime, timedelta
+
+# הגדרות חיבור
+ib = IB()
+ib.connect('127.0.0.1', 7496, clientId=4001)
+
+# הגדרת טווח תאריכים
+end_date = datetime.now()
+start_date = end_date - timedelta(days=30)
+
+# רשימת מניות SP500
+def get_sp500_tickers():
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    table = pd.read_html(url)[0]
+    return [sym.replace('.', '-') for sym in table['Symbol']]
+
+tickers = get_sp500_tickers()
+
+# פונקציית משיכת נתונים היסטוריים
+def fetch_historical_data(ticker):
+    contract = Stock(ticker, 'SMART', 'USD')
+    try:
+        ib.qualifyContracts(contract)
+        bars = ib.reqHistoricalData(
+            contract,
+            endDateTime=end_date,
+            durationStr='30 D',
+            barSizeSetting='1 day',
+            whatToShow='TRADES',
+            useRTH=True,
+            formatDate=1
+        )
+        if not bars:
+            return pd.DataFrame()
+        df = util.df(bars)[['date', 'open', 'close']]
+        df.set_index('date', inplace=True)
+        return df
+    except Exception as e:
+        print(f"שגיאה עבור {ticker}: {e}")
+        return pd.DataFrame()
+
+# פונקציית גילוי GAPים פתוחים
+def detect_open_gaps(df, symbol):
+    if df.empty:
+        return []
+    df['Prev Close'] = df['close'].shift(1)
+    df.dropna(inplace=True)
+
+    if not pd.api.types.is_datetime64_any_dtype(df.index):
+        df.index = pd.to_datetime(df.index)
+
+    gaps = []
+    for idx, row in df.iterrows():
+        open_price = row['open']
+        close_price = row['close']
+        prev_close = row['Prev Close']
+
+        if open_price > prev_close * 1.01 and close_price > prev_close:
+            gaps.append({
+                'Ticker': symbol,
+                'Date': idx.date(),
+                'Type': 'Gap Up',
+                'Still Open': True,
+                'Prev Close': round(prev_close, 2),
+                'Open': round(open_price, 2),
+                'Close': round(close_price, 2)
+            })
+        elif open_price < prev_close * 0.99 and close_price < prev_close:
+            gaps.append({
+                'Ticker': symbol,
+                'Date': idx.date(),
+                'Type': 'Gap Down',
+                'Still Open': True,
+                'Prev Close': round(prev_close, 2),
+                'Open': round(open_price, 2),
+                'Close': round(close_price, 2)
+            })
+    return gaps
+
+# איסוף הנתונים
+all_gaps = []
+for i, symbol in enumerate(tickers):
+    df = fetch_historical_data(symbol)
+    gaps = detect_open_gaps(df, symbol)
+    all_gaps.extend(gaps)
+    if i % 10 == 0:
+        print(f"✅ סרקנו {i} מניות...")
+    time.sleep(1.2)
+
+# שמירה לקובץ CSV
+df_gaps = pd.DataFrame(all_gaps)
+if not df_gaps.empty:
+    df_gaps.to_csv("ib_open_gaps.csv", index=False)
+    print("✔️ הקובץ נשמר: ib_open_gaps.csv")
+else:
+    print("❌ לא נמצאו GAPים פתוחים.")
+
+ib.disconnect()
