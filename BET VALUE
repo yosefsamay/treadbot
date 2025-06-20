@@ -1,57 +1,62 @@
-import yfinance as yf
-import datetime
+# התקנת ספריות
+!pip install yfinance pandas --quiet
 
-# רשימת 50 המניות הגדולות (ניתן להרחיב או לשנות לפי צורך)
-top_50_tickers = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "BRK-B", "LLY", "JPM", "TSLA",
-    "V", "UNH", "JNJ", "WMT", "XOM", "MA", "PG", "CVX", "HD", "MRK",
-    "ABBV", "COST", "PEP", "BAC", "AVGO", "KO", "ADBE", "TMO", "DIS", "CSCO",
-    "PFE", "MCD", "INTC", "ABT", "CMCSA", "VZ", "WFC", "ACN", "NFLX", "DHR",
-    "LIN", "TXN", "ORCL", "AMD", "NEE", "NKE", "QCOM", "UPS", "CRM", "BMY"
+# ייבוא ספריות
+import yfinance as yf
+import pandas as pd
+import time
+from IPython.display import display, HTML
+
+# רשימת 30 מניות אמריקאיות עם שווי שוק גבוה ואופציות שבועיות
+tickers = [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK-B", "UNH", "LLY",
+    "JPM", "JNJ", "V", "PG", "HD", "MA", "XOM", "AVGO", "CVX", "MRK",
+    "PEP", "ABBV", "COST", "KO", "BAC", "MCD", "ADBE", "PFE", "CRM", "WMT"
 ]
 
-for ticker in top_50_tickers:
-    print(f"\n=========== {ticker} ===========")
-    try:
-        ticker_yf = yf.Ticker(ticker)
-        options_dates = ticker_yf.options
+results = []
 
-        # סינון תאריכים בטווח 7–30 יום מהיום
-        valid_dates = [d for d in options_dates if 7 <= (datetime.datetime.strptime(d, '%Y-%m-%d').date() - datetime.date.today()).days <= 30]
-        if not valid_dates:
-            print(f"אין פקיעות בטווח 7–30 ימים עבור {ticker}.")
+for ticker in tickers:
+    try:
+        print(f"🔍 בודק את {ticker}...")
+        stock = yf.Ticker(ticker)
+
+        # מנוחה כדי לא לחטוף Rate Limit
+        time.sleep(1)
+
+        # היסטוריית מחירים – חודש אחרון
+        hist = stock.history(period="1mo")
+        if len(hist) < 20:
+            print(f"⚠️ נתונים לא מספיקים ל-{ticker}")
             continue
 
-        selected_expiry = valid_dates[0]
-        opt_chain = ticker_yf.option_chain(selected_expiry)
-        puts = opt_chain.puts
+        current_price = hist["Close"].iloc[-1]
+        ma20 = hist["Close"].rolling(window=20).mean().iloc[-1]
 
-        # סינון אופציות עם bid == 0 או ask == 0
-        puts = puts[(puts['bid'] > 0) & (puts['ask'] > 0)]
-        puts = puts.sort_values(by="strike")
-        recommendations = []
+        if pd.isna(ma20):
+            print(f"⚠️ אין ממוצע נע 20 ל-{ticker}")
+            continue
 
-        for i in range(len(puts)):
-            sell = puts.iloc[i]
-            sell_mid = (sell['bid'] + sell['ask']) / 2
-            credit = round(sell_mid, 2)
-            strike = sell['strike']
-            if credit * 100 <= 1000:
-                recommendations.append({
-                    'Sell Strike': strike,
-                    'Sell Mid Price': credit,
-                    'Max Credit': credit * 100,
-                    'Expiry': selected_expiry
-                })
+        gap_percent = abs(current_price - ma20) / ma20
 
-        if not recommendations:
-            print("לא נמצאו עסקאות מתאימות ל-PUT SPREAD בטווח הסיכון.")
-        else:
-            print("המלצות PUT למכירה:")
-            for rec in recommendations:
-                print(f"מכירה PUT @ {rec['Sell Strike']} (${rec['Sell Mid Price']})")
-                print(f"-> קרדיט משוער: ${rec['Max Credit']} | פקיעה: {rec['Expiry']}")
-                print("-")
+        # מרווח מעל 1% בלבד
+        if gap_percent >= 0.01:
+            results.append({
+                "Ticker": ticker,
+                "Current Price": round(current_price, 2),
+                "MA20": round(ma20, 2),
+                "Gap (%)": round(gap_percent * 100, 2)
+            })
 
     except Exception as e:
-        print(f"שגיאה ב-{ticker}: {e}")
+        print(f"❌ שגיאה עם {ticker}: {e}")
+
+# יצירת טבלה
+df = pd.DataFrame(results).sort_values(by="Gap (%)", ascending=False).reset_index(drop=True)
+
+# הצגת תוצאה יפה ב-Colab
+if not df.empty:
+    print("\n✅ מניות עם מרווח מעל 1% מהממוצע נע 20:")
+    display(HTML(df.to_html(index=False)))
+else:
+    print("❌ לא נמצאו מניות עם מרווח מעל 1%.")
